@@ -111,27 +111,32 @@ typedef struct {
     uint8_t cnf3;
 } bitrate_cfg_t;
 
-/* CNF values for 8 MHz crystal — verified mathematically:
- * TQ=2*(BRP+1)/Fosc; bit time=TQ×(1+PropSeg+PS1+PS2).
- * All entries use BRP=0 (TQ=250ns) with 16TQ/bit = 4µs = 250kbps base.
- * S4=125k: BRP=1(TQ=500ns), 16TQ → 8µs = 125kbps.
- * S5=250k: BRP=0(TQ=250ns), 16TQ → 4µs = 250kbps (matches Pico 2 SLCAN).
- * S6=500k: BRP=0(TQ=250ns),  8TQ → 2µs = 500kbps.
- */
-static const bitrate_cfg_t bitrate_table[5] = {
-    { 0x01, 0x9E, 0x03 },  /* [0] S4 = 125 kbps  BRP=1,TQ=500ns, 16TQ */
-    { 0x00, 0x9E, 0x03 },  /* [1] S5 = 250 kbps  BRP=0,TQ=250ns, 16TQ ← default */
-    { 0x00, 0x90, 0x02 },  /* [2] S6 = 500 kbps  BRP=0,TQ=250ns,  8TQ */
-    { 0x00, 0x86, 0x02 },  /* [3] S7 = 800 kbps  (approximate) */
-    { 0x00, 0x80, 0x00 },  /* [4] S8 = 1 Mbps    BRP=0,TQ=250ns,  4TQ */
+/* CNF values for 8 MHz crystal — formula: TQ=2*(BRP+1)/8MHz, bit=TQ*(1+PROP+PS1+PS2).
+ * Table indexed by S-command (0=S0=10k … 8=S8=1M).
+ * Values audited against DS21801J; SP% = (1+PROP+PS1)/(total TQ) × 100.
+ *
+ * 500kbps: Fixed from SP=62.5% (below 70% floor) to SP=87.5%.
+ * 800kbps: Was WRONG (333kbps actual). Best-effort 800k at 8MHz — marginal.
+ * 1Mbps:   4TQ — below CiA 8-TQ minimum but works in practice.
+ * 10k/20k/50k/100k: Added (were missing). */
+static const bitrate_cfg_t bitrate_table[9] = {
+    { 0x13, 0xBE, 0x03 },  /* [0] S0 =  10 kbps  BRP=19,TQ=5000ns, 20TQ,80%SP */
+    { 0x09, 0xBE, 0x03 },  /* [1] S1 =  20 kbps  BRP=9, TQ=2500ns, 20TQ,80%SP */
+    { 0x04, 0xB4, 0x02 },  /* [2] S2 =  50 kbps  BRP=4, TQ=1250ns, 16TQ,81.25%SP */
+    { 0x01, 0xBE, 0x03 },  /* [3] S3 = 100 kbps  BRP=1, TQ=500ns,  20TQ,80%SP */
+    { 0x01, 0x9E, 0x03 },  /* [4] S4 = 125 kbps  BRP=1, TQ=500ns,  16TQ,75%SP */
+    { 0x00, 0x9E, 0x03 },  /* [5] S5 = 250 kbps  BRP=0, TQ=250ns,  16TQ,75%SP ← CONFIRMED ✓ */
+    { 0x00, 0x99, 0x00 },  /* [6] S6 = 500 kbps  BRP=0, TQ=250ns,   8TQ,87.5%SP (fixed SP) */
+    { 0x00, 0x88, 0x00 },  /* [7] S7 = 800 kbps  BRP=0, TQ=250ns,   5TQ,80%SP (marginal) */
+    { 0x00, 0x80, 0x00 },  /* [8] S8 =   1 Mbps  BRP=0, TQ=250ns,   4TQ,75%SP (below CiA min) */
 };
 
-/* Map S-command (4-8) to table index */
+/* Map S-command byte (0-8) to table index */
 static int brate_index(uint8_t s_cmd)
 {
-    if (s_cmd >= 4 && s_cmd <= 8)
-        return (int)(s_cmd - 4);
-    return 2; /* default: 500k */
+    if (s_cmd <= 8)
+        return (int)s_cmd;
+    return 5; /* default: 250k */
 }
 
 /* Apply CNF registers in config mode */
