@@ -232,6 +232,135 @@ CNF2=0x9E: BTLMODE=1, PHSEG1=3(4Tq), PRSEG=6(7Tq). CNF3=0x03: PHSEG2=3(4Tq).
 
 ---
 
+## 15. slcand Holds ttyACMx — Must Stop Before Direct SLCAN Access
+
+**Category:** Tooling / System Integration  
+**Problem:** The ROS2 stack (or any SocketCAN setup) runs `slcand` to bridge the Pico 2 USB SLCAN port to a `slcan0` kernel network interface. Any Python script that opens `ttyACM1` directly (OTA tool, test scripts) fails with `ENOTTY (error 25, Inappropriate ioctl for device)` because slcand holds an exclusive file descriptor.  
+**Fix:** Stop slcand before test, restart after.
+
+```python
+import subprocess, time
+
+# Stop slcand (releases ttyACM1)
+subprocess.run(['killall', 'slcand'], capture_output=True)
+time.sleep(0.5)
+subprocess.run(['ip', 'link', 'set', 'slcan0', 'down'], capture_output=True)
+
+# ... run OTA / direct SLCAN tests ...
+
+# Restart slcand (restores SocketCAN for ROS2)
+subprocess.Popen(['slcand', '-o', '-s4', '-t', 'hw', '-S', '115200', '/dev/ttyACM1', 'slcan0'])
+time.sleep(0.8)
+subprocess.run(['ip', 'link', 'set', 'slcan0', 'up'], capture_output=True)
+```
+
+**Key insight:** `pgrep -a slcand` shows whether it is running and which port it holds.
+
+---
+
+## 16. MCP2515 Lazy-Init Diagnostic Frame Only Fires Once
+
+**Category:** Firmware / Testing  
+**Problem:** The app sends a SPI diagnostic frame (0x602) only the **first** time MCP2515 is initialised (lazy init on first 0x600 trigger). Subsequent runs with `g_mcp_initialized=1` skip the diagnostic. A test that checks CANSTAT via the 0x602 frame will falsely report failure on the second run even though MCP2515 TX is working fine (0x601 arrives 10/10).  
+**Fix:** Use the TX frame count as the primary health metric. Treat CANSTAT as supplementary info available only on first init.
+
+```python
+# WRONG — fails on second run:
+ok = (canstat == 0x00) and (mcp_tx_recv == N)
+
+# CORRECT — primary metric is actual TX success:
+ok = mcp_tx_recv >= N * 0.90
+# CANSTAT=0x00 from 0x602 is bonus confirmation on first run only
+```
+
+---
+
+## 17. Drain Input Buffer Before EFLG 'F' Query
+
+**Category:** Tooling  
+**Problem:** After a burst TX test (100 frames @ 3ms = 300ms of traffic) the RX buffer contains hundreds of queued ACK ('z') and echo frames. Sending 'F\r' then immediately reading 20 bytes returns the start of those queued frames, not the EFLG response.  
+**Fix:** Drain the buffer completely before sending 'F'.
+
+```python
+# After burst TX:
+time.sleep(1.5)                    # let all echo frames arrive
+while s.in_waiting:
+    s.read(s.in_waiting)
+    time.sleep(0.1)                # re-check: USB may deliver in batches
+s.write(b'F\r')
+time.sleep(0.5)
+# Then read looking specifically for token starting with 'F':
+for token in s.read(64).split(b'\r'):
+    t = token.strip()
+    if t and t[:1] == b'F' and len(t) <= 4:
+        eflg = int(t[1:], 16); break
+```
+
+---
+
+## 18. OTA in Test Scripts: Import Module, Don't Subprocess
+
+**Category:** Tooling  
+**Problem:** Launching `can_ota_bluepill.py` as a `subprocess.Popen` with `stdout=PIPE` from a test harness creates a race: the outer script must reset the Blue Pill at the right moment, but the subprocess buffers its own output (not a TTY → block-buffered) so the outer loop sees nothing until the process exits. Also, if slcand was running and the outer script forgot to kill it before `Popen`, the subprocess fails immediately.  
+**Fix:** Import the OTA module directly with `importlib` — runs in-process, shares the already-open serial handle, no timing race.
+
+```python
+import importlib.util
+spec = importlib.util.spec_from_file_location('can_ota', '/path/to/can_ota_bluepill.py')
+can_ota = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(can_ota)
+
+s = can_ota.slcan_open(PORT)        # open once
+uid0, _ = can_ota.wait_for_hello(s, timeout=5.0)
+fw = open('firmware.bin', 'rb').read()
+ok = can_ota.upload_firmware(s, fw, uid0)
+s.close()
+```
+
+---
+
+## 19. BKP Register Clear in Automated Tests
+
+**Category:** Testing  
+**Problem:** An app that was previously triggered to reboot-to-bootloader leaves `BKP_DR1=0xB001` set. The next automated test reset sees the magic value and enters the 30-second bootloader window instead of the 500ms one. The test hangs for 30s or times out while waiting for the app to start.  
+**Fix:** Every automated reset must clear BKP_DR1 via SWD before calling `st-flash reset`.
+
+```python
+def clear_bkp():
+    def w32(a, v):
+        open('/tmp/wb.bin','wb').write(struct.pack('<I', v))
+        subprocess.run(['st-flash','write','/tmp/wb.bin',f'0x{a:08X}'], capture_output=True)
+    def r32(a):
+        subprocess.run(['st-flash','read','/tmp/rb.bin',f'0x{a:08X}','4'], capture_output=True)
+        d = open('/tmp/rb.bin','rb').read()[:4]
+        return struct.unpack('<I', d)[0] if len(d) == 4 else 0
+    w32(0x4002101C, r32(0x4002101C) | (3 << 27))  # RCC: PWREN + BKPEN
+    time.sleep(0.05)
+    w32(0x40007000, r32(0x40007000) | (1 << 8))    # PWR_CR: DBP
+    time.sleep(0.05)
+    w32(0x40006C04, 0)                              # BKP_DR1 = 0
+    time.sleep(0.05)
+```
+
+---
+
+## 20. bxCAN Echo Technique — Prove RX Without SWD
+
+**Category:** Debugging  
+**Problem:** Reading `g_rx_count` via SWD to verify bxCAN receive is unreliable — variable addresses shift between builds (BSS layout changes). The address read via SWD may not match the compiled binary.  
+**Fix:** Add an echo in the app: transmit `id+1` for every received frame. The Pico 2 sees the echo frame → proves bxCAN RX is working, no SWD needed.
+
+```c
+// App main loop — CAN RX echo (diagnostic)
+if (bxcan_app_rx(&id, data, &dlc, &ext)) {
+    bxcan_app_tx(id + 1U, data, dlc, ext);  // echo on id+1
+    // ... rest of handling ...
+}
+// Send 0x300, expect 0x301 back → bxCAN RX confirmed ✓
+```
+
+---
+
 ## Summary Table
 
 | Bug # | Severity | Component | Issue | Fix |
@@ -245,4 +374,10 @@ CNF2=0x9E: BTLMODE=1, PHSEG1=3(4Tq), PRSEG=6(7Tq). CNF3=0x03: PHSEG2=3(4Tq).
 | 8 | High | bxCAN | LBKM not SILM for listen | bit31 not bit30 |
 | 9 | High | bxCAN | bxCAN FIFO overflow | 2ms inter-frame |
 | 10 | High | OTA tool | Missing 'D' handler in loop | elif ack=='D' |
-| 11+ | Med/Low | Various | Comments, types, edge cases | See git log |
+| 11-14 | Med/Low | Various | Comments, types, edge cases | See git log |
+| 15 | High | System | slcand blocks ttyACMx | Kill before test, restart after |
+| 16 | Med | Testing | Lazy-init diag only fires once | Use TX count as primary metric |
+| 17 | Med | Testing | Buffer not drained before EFLG | Drain then send 'F' |
+| 18 | High | Tooling | Subprocess OTA port conflict | Import module inline |
+| 19 | Critical | Testing | BKP=0xB001 causes 30s BL window | Clear BKP before every reset |
+| 20 | Med | Debugging | SWD rx_count address shifts | bxCAN echo (id+1) instead |
