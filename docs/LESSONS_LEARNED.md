@@ -381,3 +381,59 @@ if (bxcan_app_rx(&id, data, &dlc, &ext)) {
 | 18 | High | Tooling | Subprocess OTA port conflict | Import module inline |
 | 19 | Critical | Testing | BKP=0xB001 causes 30s BL window | Clear BKP before every reset |
 | 20 | Med | Debugging | SWD rx_count address shifts | bxCAN echo (id+1) instead |
+
+---
+
+## 21. Motor LOW-SIDE Must Be HIGH at Bootloader Startup (Short-Brake)
+
+**Category:** Hardware Safety — Hoverboard / 3-phase bridge  
+**Problem:** Bootloader drove ALL motor PWM pins LOW at startup. Driving low-side pins LOW leaves motor phases floating. Floating gate-driver inputs (via bootstrap capacitor charge/leakage) can randomly activate FETs, causing wheels to receive power and brake unpredictably when the power button is pressed.
+
+**Root cause confirmed by:** `bipropellant/bipropellant-hoverboard-firmware src/setup.c`:
+```c
+sConfigOC.OCIdleState  = TIM_OCIDLESTATE_RESET;  // high-side idle = LOW  ← FET off
+sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_SET;   // low-side idle  = HIGH ← FET on
+sBreakDeadTimeConfig.OffStateRunMode  = TIM_OSSR_ENABLE;  // enforce idle states
+sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
+```
+
+**Correct safe state = SHORT-BRAKE:**
+
+| Gate | State | Effect |
+|------|-------|--------|
+| High-side (UH/VH/WH) | LOW → FET OFF | No battery current to motor |
+| Low-side (UL/VL/WL) | **HIGH → FET ON** | Motor phases shorted to GND = defined braking |
+
+```c
+/* HIGH-SIDE pins → OUTPUT LOW  (FETs off) */
+PIN_OUT(GPIOA, 8);  PIN_LOW(GPIOA, 8);   /* TIM1 UH */
+PIN_OUT(GPIOA, 9);  PIN_LOW(GPIOA, 9);   /* TIM1 VH */
+// ... etc for all UH/VH/WH pins
+
+/* LOW-SIDE pins → OUTPUT HIGH (FETs on = short-brake) */
+PIN_OUT(GPIOB, 13); PIN_HIGH(GPIOB, 13); /* TIM1 UL */
+PIN_OUT(GPIOB, 14); PIN_HIGH(GPIOB, 14); /* TIM1 VL */
+// ... etc for all UL/VL/WL pins
+```
+
+**Additional safety layers in reference firmware:**
+- `enable = 0` declared globally → BLDC ISR clears MOE on every 16kHz tick until `enable=1`
+- `BldcControllerParams.initialized == 0` → third guard, MOE stays off until controller configured
+- `Pulse = 0` at timer init → even if MOE set accidentally, duty cycle is zero
+- Dead-time = 32 counts (~500ns) → hardware prevents shoot-through during transitions
+
+---
+
+## 22. SOFTWARE_SERIAL_USE_SWD_PINS Permanently Breaks SWD
+
+**Category:** Firmware / Debug  
+**Problem:** `CONTROL_TYPE=9` in bipropellant firmware defines `SOFTWARE_SERIAL_USE_SWD_PINS`, which causes `SoftwareSerialInit()` to reconfigure PA13 (SWDIO) and PA14 (SWCLK) as GPIO outputs for software serial debug. After the app runs and CAN init succeeds, SWD is permanently broken for the session — `st-flash` and `openocd` both fail with "unable to connect to target."
+
+**Recovery:** Only a power cycle restores SWD (during the bootloader's 2.25s window before the app restarts and breaks it again). Flashing must happen within that 2.25-second window.
+
+**Fix:** Undefine `SOFTWARE_SERIAL` in the build so `SoftwareSerialInit()` is never called:
+```makefile
+C_DEFS = ... -DCONTROL_TYPE=9 -USOFTWARE_SERIAL -USOFTWARE_SERIAL_USE_SWD_PINS
+```
+
+**Rule:** Never use PA13/PA14 for firmware features when ST-Link debugging is needed. Reserve those pins exclusively for SWD throughout development.
