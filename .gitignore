@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.map
+*.lst
+build/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+*.code-workspace
+.idea/
+
+# st-flash temp
+/tmp/r.bin
+/tmp/w.bin
