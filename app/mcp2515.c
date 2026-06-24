@@ -413,3 +413,5 @@ uint8_t mcp2515_read_errors(void)
                    0x00);
     return eflg;
 }
+
+uint8_t mcp2515_read_canstat(void) { return mcp_read_reg(MCP_CANSTAT); }

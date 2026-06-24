@@ -341,11 +341,25 @@ int main(void)
      * Immediate open prevents the Pico 2 SLCAN bridge from going BUS-OFF
      * during a listen-only window (no ACK node → too many TX errors → BUS-OFF).
      * The 'C' SLCAN command closes the bus if needed; 'O' reopens it. */
-    /* bxCAN replaces MCP2515 for 3-node CAN test (PB8/PB9 + TJA1050) */
+    /* Init bxCAN (PB8/PB9 + TJA1050) — Standard Mode (osm=0: auto-retry). */
     bxcan_app_init(250000, 0);
     g_brate   = MCP_BRATE_250K;
     g_mode    = MODE_CAN;
-    g_can_open = 1;  /* bxCAN always open after init */
+    g_can_open = 1;
+
+    /* MCP2515 init deferred: initialized on first use via ID=0x600 trigger. */
+    static uint8_t g_mcp_initialized = 0;
+
+    /* Drain bxCAN FIFO: bootloader may have left frames in the FIFO (hello
+     * broadcasts on 0x7DE). If the FIFO is full (FMP=3, FOVR set) when the
+     * app starts, bxcan_app_rx_available() returns true but new frames cannot
+     * enter until the overflow is cleared.  Drain all pending frames now so
+     * the main loop starts with an empty FIFO and correct FOVR=0 state. */
+    {
+        uint32_t dummy_id; uint8_t dummy_data[8]; uint8_t dummy_dlc; int dummy_ext;
+        while (bxcan_app_rx_available())
+            bxcan_app_rx(&dummy_id, dummy_data, &dummy_dlc, &dummy_ext);
+    }
 
     /* 5. Banner */
     usart1_print("\r\nBlue Pill CAN Tool v1\r\n");
@@ -360,19 +374,22 @@ int main(void)
     while (1) {
 
         /* ----------------------------------------------------------------
-         * CAN RX — check for received frames (only when bus is open)
+         * bxCAN RX — always active (bxCAN is always open after init).
+         * g_can_open tracks MCP2515 SLCAN open/close state; it does NOT
+         * gate bxCAN which has its own independent peripheral. Checking
+         * g_can_open here caused bxCAN RX to stop when a spurious SLCAN
+         * 'C' or 'S' command arrived on floating USART1 RX (PA10). Fixed:
+         * bxCAN RX is now unconditional; g_can_open only gates MCP2515 TX.
          * ---------------------------------------------------------------- */
-        if (g_mode == MODE_CAN && g_can_open) {
-            /* Poll: check INT pin (active-low) or CANINTF directly */
-            if (bxcan_app_rx_available()) {
+        if (g_mode == MODE_CAN) {
+            while (bxcan_app_rx_available()) {
                 uint32_t id  = 0;
                 uint8_t  dlc = 0;
                 uint8_t  data[8] = {0};
                 int      ext = 0;
 
                 if (bxcan_app_rx(&id, data, &dlc, &ext)) {
-                    /* CAN bootloader trigger: 0x7FF [0xB0,0x01,0xB2] →
-                     * write BKP magic and reset into bootloader (30s window). */
+                    /* CAN bootloader trigger: 0x7FF [0xB0,0x01,0xB2] */
                     if (id == 0x7FFU && dlc >= 3 &&
                         data[0] == 0xB0U && data[1] == 0x01U && data[2] == 0xB2U) {
                         RCC_APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
@@ -380,6 +397,42 @@ int main(void)
                         BKP_DR1      = 0xB001U;
                         NVIC_SystemReset();
                     }
+                    /* CAN bootloader CLEAR trigger: 0x7FF [0xB0,0x00,0xB2]
+                     * Clears BKP_DR1 so the next reset uses the 500ms window,
+                     * not the 30s extended window.  Send this before any reset
+                     * that is NOT intended to start a firmware upload session. */
+                    if (id == 0x7FFU && dlc >= 3 &&
+                        data[0] == 0xB0U && data[1] == 0x00U && data[2] == 0xB2U) {
+                        RCC_APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+                        PWR_CR      |= PWR_CR_DBP;
+                        BKP_DR1      = 0x0000U;   /* clear — BL will use 500ms window */
+                        NVIC_SystemReset();
+                    }
+                    /* MCP2515 TX trigger: ID=0x600 → lazy-init MCP2515, then TX 0x601.
+                     * Lazy init avoids interference with bxCAN during startup. */
+                    if (id == 0x600U) {
+                        uint8_t mcp_canstat = 0xFF;  /* 0xFF = SPI not responding */
+                        if (!g_mcp_initialized) {
+                            mcp2515_init(MCP_BRATE_250K);
+                            int init_ok = mcp2515_enter_normal();
+                            mcp_canstat = mcp2515_read_canstat();
+                            g_mcp_initialized = 1;
+                            /* Send SPI diagnostic on 0x602: [data[0], init_ok, CANSTAT] */
+                            uint8_t diag[3]={(uint8_t)data[0],(uint8_t)(init_ok==0?1:0),mcp_canstat};
+                            bxcan_app_tx(0x602U, diag, 3, 0);
+                        } else {
+                            mcp_canstat = mcp2515_read_canstat();
+                        }
+                        uint8_t mcp_tx[4] = {data[0], 0xC1, mcp_canstat, (uint8_t)(g_rx_count & 0xFF)};
+                        mcp2515_tx(0x601U, mcp_tx, 4, 0);
+                    }
+                    /* Echo received frame on id+1 so Pico2 can see bxCAN received it.
+                     * Skipped for 0x7FF (bootloader trigger/clear — resets before TX
+                     * would be useful) and 0x600 (MCP2515 trigger — has its own reply).
+                     * This proves bxCAN RX without requiring SWD g_rx_count reads. */
+                    if (id != 0x7FFU && id != 0x600U)
+                        bxcan_app_tx(id + 1U, data, dlc, ext);
+
                     char line[32];
                     slcan_format_rx(id, ext, dlc, data, line);
                     usart1_print(line);
@@ -387,8 +440,7 @@ int main(void)
                     g_rx_count++;
                 }
 
-                /* Check for error/overrun and auto-clear CANINTF error bits */
-                /* bxCAN handles errors internally */;
+                /* bxCAN handles errors internally via ESR register */
             }
         }
 
