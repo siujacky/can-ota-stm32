@@ -342,12 +342,10 @@ int main(void)
      * during a listen-only window (no ACK node → too many TX errors → BUS-OFF).
      * The 'C' SLCAN command closes the bus if needed; 'O' reopens it. */
     /* bxCAN replaces MCP2515 for 3-node CAN test (PB8/PB9 + TJA1050) */
-    /* Standard Mode (osm=0): auto-retry on no-ACK — normal CAN node behaviour.
-     * Use osm=1 only for OTA bootloader (host controls retries at protocol level). */
     bxcan_app_init(250000, 0);
     g_brate   = MCP_BRATE_250K;
     g_mode    = MODE_CAN;
-    g_can_open = 1;
+    g_can_open = 1;  /* bxCAN always open after init */
 
     /* 5. Banner */
     usart1_print("\r\nBlue Pill CAN Tool v1\r\n");

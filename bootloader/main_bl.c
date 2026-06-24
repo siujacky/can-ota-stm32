@@ -866,7 +866,7 @@ int main(void)
     bl_config_read(&g_config);
 
     /* 3. Init both transports */
-    bxcan_init(1);   
+    bxcan_init(1);  /* OSM: no auto-retry in bootloader */   
     usart_init();
 
     /* ----------------------------------------------------------------
@@ -888,7 +888,7 @@ int main(void)
      *   [6] = BL_VERSION_MAJOR    — firmware version so network knows which node woke
      *   [7] = BL_VERSION_MINOR
      *
-     * With OSM (One-Shot Mode) set in bxcan_init(1), each broadcast
+     * With OSM (One-Shot Mode) set in bxcan_init(), each broadcast
      * attempt exits immediately if no ACK instead of retrying forever.
      * We retry manually every HELLO_INTERVAL_MS up to HELLO_MAX_TRIES
      * times; after that we boot the existing app even without a host.
